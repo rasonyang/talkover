@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-free:
+    name: Lint and GPU-free tests
+    runs-on: ubuntu-latest
+    steps:
+      # pyproject.toml declares mcpmft and gander-runtime as path dependencies at
+      # ../Omni-Interaction-Agent/{minicpm_ft,gander_runtime}. Both repositories are
+      # checked out as siblings inside $GITHUB_WORKSPACE so that the relative path resolves.
+      - name: Check out talkover
+        uses: actions/checkout@v4
+        with:
+          path: talkover
+
+      - name: Check out Omni-Interaction-Agent (pinned upstream)
+        uses: actions/checkout@v4
+        with:
+          repository: Omni-Interaction-Gander/Omni-Interaction-Agent
+          ref: cf43838ac270ffab6e849b9c528b181adc0a54c4
+          path: Omni-Interaction-Agent
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: talkover/uv.lock
+
+      # Neither the cuda nor the mps extra is installed: both only add an ASR backend
+      # (faster-whisper / mlx-whisper) that the GPU-free suites do not exercise.
+      - name: Install dependencies
+        working-directory: talkover
+        run: uv sync --extra dev
+
+      - name: ruff check
+        working-directory: talkover
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        working-directory: talkover
+        run: uv run ruff format --check .
+
+      - name: pytest -m cpu
+        working-directory: talkover
+        run: uv run pytest -m cpu
+
+      - name: pytest tests/protocol tests/brain
+        working-directory: talkover
+        run: uv run pytest tests/protocol tests/brain

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "talkover"
+version = "0.1.0"
+description = "Inference gateway wrapping the Gander full-duplex interaction model as an OpenAI Realtime compatible service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "rason yang" }]
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "websockets>=12",
+  "httpx>=0.27",
+  "numpy<2",
+  "scipy>=1.11",
+  "pyyaml>=6",
+  "torch>=2.6,<2.7",
+  # torchaudio carries a C++ extension built against one torch ABI and stepaudio2's
+  # token2wav imports it, so it has to follow the torch pin (2.11 + torch 2.6 fails to
+  # dlopen). See docs/mps-porting-notes.md, T1.5.
+  "torchaudio>=2.6,<2.7",
+  # librosa 0.9 (pinned upstream through minicpmo-utils) still imports pkg_resources,
+  # which setuptools removed in 81.
+  "setuptools<81",
+  # onnx 1.19 (pulled in by s3tokenizer) needs the float4 dtypes from ml_dtypes 0.5.1,
+  # which in turn needs numpy>=2; upstream pins numpy<2, so onnx stays below 1.18.
+  "onnx<1.18",
+  "mcpmft[talker]>=1.0.0",
+  "gander-runtime>=1.0.0",
+]
+
+[project.optional-dependencies]
+mps = ["mlx-whisper>=0.4"]
+cuda = ["faster-whisper>=1.2,<2", "torchao>=0.9"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+talkover = "talkover.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/talkover"]
+
+[tool.uv]
+# eva-decord (the video decoding dependency of minicpmo-utils[tts]) has no wheel for macOS + Python 3.12.
+# Talkover does not decode video under media_mode: voice, so it is restricted to Linux.
+#
+# deepspeed 0.19.x cannot be imported under the pinned torch 2.6: its AutoTP custom ops annotate
+# parameters as `list[int]`, which torch.library.infer_schema only accepts from torch 2.7 on, so
+# `import deepspeed` raises ValueError. transformers.modeling_utils imports it whenever it is
+# installed, which breaks every real model load. Upstream mcpmft only needs it for mcpmft.train.*,
+# which Talkover never imports (training is a non-goal), so it is restricted to Linux the same way.
+# See docs/mps-porting-notes.md, 2026-09-18.
+override-dependencies = [
+  "eva-decord; sys_platform == 'linux'",
+  "deepspeed; sys_platform == 'linux'",
+]
+
+[tool.uv.sources]
+mcpmft = { path = "../Omni-Interaction-Agent/minicpm_ft", editable = true }
+gander-runtime = { path = "../Omni-Interaction-Agent/gander_runtime", editable = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "mps: cases that require an Apple Silicon MPS device",
+  "cuda: cases that require an NVIDIA CUDA device",
+  "cpu: cases that do not depend on a GPU",
+]

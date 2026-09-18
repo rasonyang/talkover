@@ -1,0 +1,49 @@
+server:
+  listen: 127.0.0.1:8000
+  api_key: ${TALKOVER_API_KEY}
+
+engine:
+  device: mps                # or cuda:0
+  talker_device: null        # may be set to cuda:1 on multi-GPU CUDA hosts
+  dtype: bfloat16
+  quantize_thinker: null     # set to int8 when A10 GPU memory is insufficient
+  init_vision: false         # voice mode does not load the vision encoder
+  base_model: /Users/rasonyang/models/MiniCPM-o-4_5
+  thinker_checkpoint: /Users/rasonyang/models/Gander/thinker
+  talker_checkpoint: /Users/rasonyang/models/Gander/talker
+  context_max_units: 128
+  sliding_window_mode: context_slate
+  media_mode: voice
+  attn_implementation: sdpa  # flash_attention_2 is accepted on CUDA
+  token2wav_dir: null        # null resolves to <base_model>/assets/token2wav
+  ref_audio_path: null       # null keeps the Talker checkpoint's own voice
+
+realtime:
+  memory_slate_max_tokens: 256   # cap on session.instructions written into the task slate
+  trailing_silence_sec: 8.0      # upstream default; also the reconnect window
+
+asr:
+  backend: auto              # mps→mlx_whisper, cuda→faster_whisper
+  model: large-v3-turbo
+  device: auto               # set to cpu when A10 GPU memory is tight
+  compute_type: auto
+
+brain:
+  provider: business
+  llm:
+    kind: anthropic
+    base_url: https://api.deepseek.com/anthropic
+    api_key: ${DEEPSEEK_API_KEY}
+    model: deepseek-flash
+  business_api:
+    base_url: http://127.0.0.1:9100
+    timeout_sec: 3
+  # Chinese phrases that trigger transfer_to_human
+  transfer_keywords: ["转人工", "人工客服", "找个人"]
+  spoken_numbers: false      # rewrite digits into segmented spoken form before speaking
+  max_rounds: 6              # LLM rounds per Brain invocation
+  # Spoken to the customer when the loop cannot answer; null uses the built-in English text
+  fallback_texts:
+    round_cap: "抱歉，这个问题我这边暂时查不到，帮您转接人工客服。"
+    failure: "抱歉，系统暂时没有响应，帮您转接人工客服。"
+    no_answer: "抱歉，我没有听清，您可以再说一遍吗？"
