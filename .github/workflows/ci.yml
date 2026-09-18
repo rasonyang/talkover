@@ -13,25 +13,25 @@ concurrency:
 jobs:
   gpu-free:
     name: Lint and GPU-free tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # pyproject.toml declares mcpmft and gander-runtime as path dependencies at
       # ../Omni-Interaction-Agent/{minicpm_ft,gander_runtime}. Both repositories are
       # checked out as siblings inside $GITHUB_WORKSPACE so that the relative path resolves.
       - name: Check out talkover
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: talkover
 
       - name: Check out Omni-Interaction-Agent (pinned upstream)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Omni-Interaction-Gander/Omni-Interaction-Agent
           ref: cf43838ac270ffab6e849b9c528b181adc0a54c4
           path: Omni-Interaction-Agent
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           enable-cache: true
