@@ -10,6 +10,7 @@ GPU-free: no model and no ASR backend, only the event types of `talkover.engine.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 
@@ -510,3 +511,203 @@ async def test_the_extra_engine_hook_still_sees_every_unit() -> None:
     await pump(session, engine, step_event(1), speak(2, text="hi", end_of_turn=True))
     assert seen == [1, 2]
     assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA, *CLOSE]
+
+
+# ---------------------------------------------------------------------------
+# holding the close chain for the threaded Talker (T1.5 / DESIGN.md 5.3, 11)
+# ---------------------------------------------------------------------------
+
+#: What upstream `DuplexLiveSession.talker_state()` reports with a `TalkerThread` attached.
+DETACHED = {"talker": {"mode": "detached", "active": True, "drained": False}}
+
+
+def chunk(index: int, **overrides: Any) -> EngineStepEvent:
+    """One late Talker waveform, as `EngineSession.audio_event` builds it."""
+    fields: dict[str, Any] = {
+        "is_listen": False,
+        "is_audio_chunk": True,
+        "audio_waveform": wave(),
+    }
+    fields.update(overrides)
+    return step_event(index, **fields)
+
+
+def drained(index: int, generation_id: int = 0, unit_id: int = 1) -> EngineStepEvent:
+    """The Talker's drained marker, as `EngineSession.drained_event` builds it."""
+    return step_event(
+        index,
+        is_listen=False,
+        is_audio_chunk=True,
+        talker_done=True,
+        unit_id=unit_id,
+        generation_id=generation_id,
+    )
+
+
+async def test_the_in_step_talker_still_closes_on_end_of_turn() -> None:
+    """The T1.4 default is unchanged: no chunks, so nothing is held."""
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Hi", audio_waveform=wave()),
+        speak(2, end_of_turn=True),
+    )
+    assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA, AUDIO_DELTA, *CLOSE]
+    assert session.mapper.talker_threaded is False
+    assert session.active_response_id is None
+
+
+async def test_end_of_turn_is_held_until_the_talker_reports_the_turn_drained() -> None:
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Hi", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, text=" there", end_of_turn=True, metrics=DETACHED),
+    )
+    # The close chain is held: the turn's own waveform has not been vocoded yet.
+    assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA, AUDIO_DELTA, TRANSCRIPT_DELTA]
+    assert session.active_response_id is not None
+
+    # A chunk arriving inside the hold is delivered normally, ...
+    await run(session, chunk(2, unit_id=2))
+    assert types_of(session)[-1] == AUDIO_DELTA
+    assert session.active_response_id is not None
+
+    # ... and the drained marker releases the chain.
+    await run(session, drained(2, unit_id=2))
+    assert types_of(session) == [
+        *OPEN,
+        TRANSCRIPT_DELTA,
+        AUDIO_DELTA,
+        TRANSCRIPT_DELTA,
+        AUDIO_DELTA,
+        *CLOSE,
+    ]
+    assert session.active_response_id is None
+    done = only_event(session, "response.done")
+    assert done["response"]["status"] == "completed"
+    assert session.mapper.dropped_audio_chunks == 0
+
+
+async def test_the_first_turn_is_held_on_the_metrics_alone() -> None:
+    """A one-unit first turn has no chunk yet; `metrics["talker"]["mode"]` still holds it."""
+    session, _ = make_session()
+    await run(session, speak(1, text="Hi", end_of_turn=True, metrics=DETACHED))
+    assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA]
+    assert session.mapper.talker_threaded is True
+
+    await run(session, chunk(1, unit_id=1), drained(1, unit_id=1))
+    assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA, AUDIO_DELTA, *CLOSE]
+
+
+async def test_the_held_audio_reaches_the_client_instead_of_being_dropped() -> None:
+    """The DESIGN.md section 11 risk, as a regression: the turn's tail is not lost."""
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Order", metrics=DETACHED),
+        speak(2, text=" 12345", end_of_turn=True, metrics=DETACHED),
+        chunk(2, unit_id=1),
+        chunk(2, unit_id=2),
+        drained(2, unit_id=2),
+    )
+    assert len(events_of(session, AUDIO_DELTA)) == 2
+    assert types_of(session).index("response.done") == len(types_of(session)) - 1
+
+
+async def test_an_interrupt_closes_immediately_and_later_chunks_are_counted() -> None:
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Let me", audio_waveform=None, metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, interrupted=True, metrics=DETACHED),
+    )
+    assert types_of(session)[-1] == "response.done"
+    assert only_event(session, "response.done")["response"]["status"] == "cancelled"
+    assert session.active_response_id is None
+
+    before = len(types_of(session))
+    await run(session, chunk(2, unit_id=2), drained(2, unit_id=2))
+    assert len(types_of(session)) == before
+    assert session.mapper.dropped_audio_chunks == 1
+
+
+async def test_an_interrupt_while_the_close_is_held_cancels_the_response() -> None:
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Hi", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, end_of_turn=True, metrics=DETACHED),
+    )
+    assert session.active_response_id is not None
+    await run(session, speak(3, interrupted=True, metrics=DETACHED))
+    assert only_event(session, "response.done")["response"]["status"] == "cancelled"
+    assert session.active_response_id is None
+
+
+async def test_the_next_turn_flushes_a_close_the_talker_never_released() -> None:
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="one", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, end_of_turn=True, metrics=DETACHED),
+        speak(3, text="two", metrics=DETACHED),
+    )
+    types = types_of(session)
+    # The first response is closed before the second one opens, so the second unit's
+    # transcript never joins the finished response.
+    assert types == [*OPEN, TRANSCRIPT_DELTA, AUDIO_DELTA, *CLOSE, *OPEN, TRANSCRIPT_DELTA]
+    responses = {event["response"]["id"] for event in events_of(session, "response.created")}
+    assert len(responses) == 2
+
+
+async def test_the_drain_timeout_closes_a_response_the_talker_abandoned() -> None:
+    """A Talker failure costs the tail of one turn, never the response."""
+    session, _ = make_session()
+    session.mapper.talker_drain_timeout_sec = 0.02
+    await run(
+        session,
+        speak(1, text="Hi", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, end_of_turn=True, metrics=DETACHED),
+    )
+    assert session.active_response_id is not None
+    await asyncio.sleep(0.1)
+    assert types_of(session) == [*OPEN, TRANSCRIPT_DELTA, AUDIO_DELTA, *CLOSE]
+    assert only_event(session, "response.done")["response"]["status"] == "completed"
+    assert session.active_response_id is None
+
+
+async def test_the_drain_timer_does_not_survive_the_response_it_guarded() -> None:
+    session, _ = make_session()
+    session.mapper.talker_drain_timeout_sec = 0.02
+    await run(
+        session,
+        speak(1, text="Hi", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, end_of_turn=True, metrics=DETACHED),
+        drained(2, unit_id=2),
+        speak(3, text="next", metrics=DETACHED),
+    )
+    await asyncio.sleep(0.1)
+    # The second response is still open: the first response's timer was cancelled.
+    assert session.active_response_id is not None
+    assert types_of(session).count("response.done") == 1
+
+
+async def test_cancel_pending_close_drops_the_hold_without_emitting_it() -> None:
+    session, _ = make_session()
+    await run(
+        session,
+        speak(1, text="Hi", metrics=DETACHED),
+        chunk(1, unit_id=1),
+        speak(2, end_of_turn=True, metrics=DETACHED),
+    )
+    session.mapper.cancel_pending_close()
+    await run(session, drained(2, unit_id=2))
+    assert "response.done" not in types_of(session)
+    assert session.active_response_id is not None

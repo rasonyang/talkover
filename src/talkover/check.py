@@ -18,7 +18,8 @@ Checks, in report order (DESIGN.md sections 8 and 9):
   configured paths exist.
 * `engine.token2wav_dir` — the token2wav assets exist, either at the configured path or at
   `<engine.base_model>/assets/token2wav`. A missing directory is a warning, not a failure:
-  the Thinker still runs, only the Talker stays silent.
+  the Thinker still runs, only the Talker stays silent. The line also echoes
+  `engine.token2wav_timesteps`, the vocoder's flow-matching step count (DESIGN.md 4.4).
 * `asr.<backend>` — the resolved ASR backend's library is installed.
 * `brain.llm.api_key` — non-empty after `${ENV_VAR}` expansion.
 * `memory` — the static estimate from :mod:`talkover.engine.memory`.
@@ -262,13 +263,14 @@ def _check_token2wav(config: TalkoverConfig) -> CheckResult:
         source = "<engine.base_model>/" + "/".join(TOKEN2WAV_SUBDIR)
     else:
         return _warn(name, "engine.base_model is empty; cannot resolve the token2wav assets")
+    steps = engine.token2wav_timesteps
     if not path.is_dir():
         return _warn(
             name,
             f"{path} ({source}) does not exist; the Thinker still runs but the Talker "
             "produces no audio",
         )
-    return _ok(name, f"{path} ({source})")
+    return _ok(name, f"{path} ({source}), {steps} flow-matching steps")
 
 
 def _check_asr(config: TalkoverConfig) -> CheckResult:

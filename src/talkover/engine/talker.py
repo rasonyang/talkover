@@ -562,6 +562,9 @@ def build_talker_runtime(
         talker_checkpoint: the Gander Talker checkpoint overlaid on top of it.
         token2wav_dir: the vocoder assets.
         prompt_wav_path: the reference wav that fixes the voice.
+        n_timesteps: the vocoder's flow-matching step count, ``engine.token2wav_timesteps``
+            (DESIGN.md 4.4 / 9). Upstream's default is 10; fewer steps cost proportionally
+            less time per unit and lower the audio quality.
         warm: run one throwaway vocoder chunk so the first real unit is not the one that
             pays for kernel compilation. The RNG state is saved and restored around it
             through the backend.
@@ -635,7 +638,8 @@ def talker_factory_from_config(
     The factory runs on the engine's inference thread, right after the checkpoints are
     loaded, because the Talker is built from the loaded Thinker. It needs a reference wav:
     upstream's runtime has no fallback voice, so ``engine.ref_audio_path`` (or the
-    ``ref_audio_path`` argument) must point at one.
+    ``ref_audio_path`` argument) must point at one. ``engine.token2wav_timesteps`` is passed
+    through to :func:`build_token2wav` as the vocoder's flow-matching step count.
 
     Raises:
         NotImplementedError: if ``engine.talker_device`` names another device. That is the
@@ -673,6 +677,7 @@ def talker_factory_from_config(
             talker_checkpoint=engine.talker_checkpoint,
             token2wav_dir=assets,
             prompt_wav_path=reference,
+            n_timesteps=engine.token2wav_timesteps,
             warm=warm,
         )
         return TalkerThread(runtime, backend)

@@ -116,6 +116,17 @@ class EngineStepEvent:
     #: ``False`` while the Talker runs inside the Thinker step, where the waveform rides
     #: the unit's own event.
     is_audio_chunk: bool = False
+    #: This event is the Talker's drained marker for :attr:`generation_id`.
+    #:
+    #: The threaded Talker (T1.5) vocodes a unit after the Thinker step that produced it
+    #: has been reported, so the waveform of the unit that ended a turn arrives *after*
+    #: that turn's ``end_of_turn``. This marker says the Talker has no more audio for the
+    #: turn: it is published once the Talker finishes the request carrying ``end_of_turn``,
+    #: and once for a generation that was cancelled. It is always carried on an
+    #: :attr:`is_audio_chunk` event with no waveform and no text; :attr:`generation_id` and
+    #: :attr:`unit_id` name the turn. ``talkover.realtime.mapping`` holds the response close
+    #: chain until it arrives (DESIGN.md 5.3). Never set while the Talker runs in step.
+    talker_done: bool = False
     #: Wall time the engine spent producing this unit, in seconds (T1.8 reads it).
     step_wall_time_sec: float = 0.0
 

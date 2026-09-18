@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 
 __all__ = [
+    "TOKEN2WAV_TIMESTEPS_RANGE",
     "AsrConfig",
     "BrainConfig",
     "BusinessApiConfig",
@@ -47,6 +48,13 @@ QUANTIZATIONS = (None, "int8")
 MEDIA_MODES = ("voice", "video")
 ATTN_IMPLEMENTATIONS = ("sdpa", "eager", "flash_attention_2")
 
+#: Accepted range for `engine.token2wav_timesteps`, inclusive.
+#:
+#: Upstream `stepaudio2.Token2wav` takes any positive `n_timesteps`; the bound is Talkover's
+#: and only rejects values that cannot be meant. Below 1 the flow matcher has nothing to
+#: integrate, and above 50 the vocoder is already five times over the 4.4 budget.
+TOKEN2WAV_TIMESTEPS_RANGE = (1, 50)
+
 
 # --------------------------------------------------------------------------------------
 # Schema
@@ -76,6 +84,12 @@ class EngineConfig:
     `token2wav_dir` is null by default, which resolves to `<base_model>/assets/token2wav`
     (`talkover.engine.session.default_token2wav_dir`); `ref_audio_path` is null by
     default, which keeps the Talker checkpoint's own voice.
+
+    `token2wav_timesteps` is the vocoder's flow-matching step count, upstream's 10 by
+    default. It is the one knob that trades vocoder quality for latency: on MPS the
+    vocoder alone costs 0.49 s per unit at 10, 0.24 s at 5 and 0.14 s at 2, against the
+    0.35 s DESIGN.md 4.4 budgets for Talker plus token2wav (see 4.4 and 9). Which value to
+    ship is T1.9's decision after a listening check; this only exposes it.
     """
 
     device: str = "mps"
@@ -91,6 +105,7 @@ class EngineConfig:
     media_mode: str = "voice"
     attn_implementation: str = "sdpa"
     token2wav_dir: str | None = None
+    token2wav_timesteps: int = 10
     ref_audio_path: str | None = None
 
     @property
@@ -327,6 +342,14 @@ def _parse_engine(raw: Any) -> EngineConfig:
     for key in ("token2wav_dir", "ref_audio_path"):
         if key in data:
             values[key] = _check_str(data[key], f"engine.{key}", allow_none=True)
+    if "token2wav_timesteps" in data:
+        timesteps = _check_int(data["token2wav_timesteps"], "engine.token2wav_timesteps")
+        if not TOKEN2WAV_TIMESTEPS_RANGE[0] <= timesteps <= TOKEN2WAV_TIMESTEPS_RANGE[1]:
+            low, high = TOKEN2WAV_TIMESTEPS_RANGE
+            raise ConfigError(
+                f"engine.token2wav_timesteps: expected an integer in {low}..{high}, got {timesteps}"
+            )
+        values["token2wav_timesteps"] = timesteps
     return EngineConfig(**values)
 
 

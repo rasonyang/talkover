@@ -26,9 +26,9 @@ malformed frames, so the transport can be tested before the state machine exists
 not resumable, so its slot is freed the moment the socket closes.
 
 The engine object follows `talkover.engine.protocol.EngineProtocol`; this module only
-reads its `ready` property and never imports the module at runtime. Stopping or resetting
-the engine when a session is released is the application's business (T2.9), reached
-through the `on_release` hook of `create_app`.
+reads its `ready` property and never imports the module at runtime. Starting, resetting and
+stopping the engine is the application's business (`talkover.app`, T2.9), reached through
+the `lifespan` and `on_release` hooks of `create_app`.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import asyncio
 import hmac
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import FastAPI, WebSocket
@@ -65,11 +66,12 @@ __all__ = [
     "ResumableSession",
     "SessionSlot",
     "create_app",
+    "default_model",
 ]
 
 LOGGER = logging.getLogger(__name__)
 
-#: `?model=` is echoed, never routed on; this is the echo when the client omits it.
+#: `?model=` is echoed, never routed on; this is the echo when the config names nothing.
 DEFAULT_MODEL = "talkover"
 
 #: Close code for a fatal server-side error (profile section 8.1).
@@ -364,6 +366,21 @@ def _default_session_factory(
 # ---------------------------------------------------------------------------
 
 
+def default_model(config: TalkoverConfig) -> str:
+    """The model name echoed when the client sends no `?model=`.
+
+    Talkover serves exactly one model, so `?model=` is never routed on (profile section 1)
+    — but a client that asked for nothing should still be told what it reached. The name of
+    the base checkpoint directory is that answer (`MiniCPM-o-4_5` for the config DESIGN.md
+    section 9 ships); :data:`DEFAULT_MODEL` stands in while `engine.base_model` is unset,
+    which is the case in every test that does not care.
+    """
+    base_model = config.engine.base_model.strip().rstrip("/")
+    if not base_model:
+        return DEFAULT_MODEL
+    return PurePath(base_model).name or DEFAULT_MODEL
+
+
 def _readiness(component: object | None) -> bool | None:
     """`True` / `False` for a configured component, `None` when not configured."""
     if component is None:
@@ -430,22 +447,25 @@ def create_app(
     session_factory: Any = None,
     on_release: Callable[[], Awaitable[None]] | None = None,
     call_later: CallLater | None = None,
+    lifespan: Any = None,
 ) -> FastAPI:
     """Build the Talkover ASGI application.
 
     `engine` follows `EngineProtocol`; `asr` and `brain` are optional and only need a
     `ready` attribute. `session_factory(websocket, config, engine, model)` returns the
-    object that drives one connection; it defaults to `DefaultSession` until T2.9 wires
-    `session.WebSocketSession` in.
+    object that drives one connection; it defaults to the placeholder `DefaultSession`,
+    which is what a bare server with no application around it gets. `talkover.app.build_app`
+    always passes `session.WebSocketSession` (T2.9).
 
     `on_release` is awaited every time the single slot becomes free again — after the
     reconnect window of a disconnected session, or straight away for a session that
-    cannot be resumed. It is where T2.9 resets the engine conversation; this module never
-    calls `engine.start` or `engine.stop` itself. `call_later` replaces the reconnect
-    timer, so tests do not wait `realtime.trailing_silence_sec` seconds.
+    cannot be resumed. It is where `talkover.app` resets the engine conversation; this
+    module never calls `engine.start` or `engine.stop` itself, and `lifespan` is the seam
+    the application hangs that on. `call_later` replaces the reconnect timer, so tests do
+    not wait `realtime.trailing_silence_sec` seconds.
     """
     factory = session_factory or _default_session_factory
-    app = FastAPI(title="Talkover", version="0.1.0")
+    app = FastAPI(title="Talkover", version="0.1.0", lifespan=lifespan)
     slot = SessionSlot(
         window_sec=config.realtime.trailing_silence_sec,
         call_later=call_later,
@@ -481,7 +501,7 @@ def create_app(
             await _deny(websocket, 401, "Missing or invalid Bearer token.")
             return
 
-        model = websocket.query_params.get("model") or DEFAULT_MODEL
+        model = websocket.query_params.get("model") or default_model(config)
         requested = _requested_session_id(websocket)
         await websocket.accept()
 

@@ -16,6 +16,7 @@ engine:
   media_mode: voice
   attn_implementation: sdpa  # flash_attention_2 is accepted on CUDA
   token2wav_dir: null        # null resolves to <base_model>/assets/token2wav
+  token2wav_timesteps: 10    # vocoder flow-matching steps, 1..50; fewer is faster and rougher (4.4)
   ref_audio_path: null       # null keeps the Talker checkpoint's own voice
 
 realtime:

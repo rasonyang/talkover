@@ -39,6 +39,13 @@ tokens, and the waveforms come back asynchronously as ``is_audio_chunk`` events,
 each step boundary and once more at shutdown. Without the factory the Talker keeps running
 inside the upstream step, which is what T1.4 validated.
 
+**The bench seam (T1.8).** ``on_unit_timing`` is an optional callback that receives one
+:class:`UnitTiming` per stepped unit and per piece of Talker work: the device-synchronized
+wall time, whatever per-stage costs upstream reported (:data:`STAGE_METRIC_KEYS`) and the
+Thinker token ids of the unit. ``scripts/bench_rtf.py`` is its only caller, nothing in
+:class:`~talkover.engine.protocol.EngineProtocol` changes because of it, and without a
+callback the only cost is the branch that skips it.
+
 Device rules (DESIGN.md 4.2): this module names no device-specific torch attribute. All
 device work goes through :class:`~talkover.engine.backend.DeviceBackend` — ``device()`` for
 placement and ``synchronize()`` at the step boundary where the per-unit timing is read.
@@ -53,7 +60,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +87,10 @@ from talkover.engine.talker import (
 
 __all__ = [
     "DEVICE_ENV_VAR",
+    "STAGE_METRIC_KEYS",
+    "STAGE_NAMES",
     "EngineSession",
+    "UnitTiming",
     "build_duplex_params",
     "build_live_config",
     "build_live_session",
@@ -109,6 +119,89 @@ _STOP_JOIN_TIMEOUT_SEC = 30.0
 #: ``max_tool_response_tokens``) says nothing about the model's health. Dropping one Brain
 #: delivery is a smaller loss than dropping the call (DESIGN.md 4.6).
 _REFUSABLE_COMMANDS = frozenset({"tool_response", "worker_delivery"})
+
+
+# --------------------------------------------------------------------------------------
+# Per-unit stage timing (T1.8)
+# --------------------------------------------------------------------------------------
+
+#: The stage names ``scripts/bench_rtf.py`` aggregates, in pipeline order (DESIGN.md 4.4).
+#:
+#: ``asr`` is not produced here: ASR is a side channel that the bench harness runs and
+#: times itself. Everything else comes from the upstream step metrics; nothing in this
+#: module instruments the model, because the stages live inside one upstream call.
+STAGE_NAMES = ("audio_encode", "thinker", "talker_prep", "talker", "token2wav", "asr")
+
+#: Upstream metric key -> stage name (``mcpmft.infer.realtime``, ``cf43838``).
+#:
+#: Upstream reports ``cost_llm``, ``cost_tts_prep``, ``cost_tts``, ``cost_token2wav`` and
+#: ``cost_all`` per step. It has no separate cost for encoding the input audio — that is
+#: folded into ``cost_llm`` — so ``audio_encode`` stays empty until upstream reports one;
+#: the keys below are tried in order and the first one present wins.
+STAGE_METRIC_KEYS: Mapping[str, tuple[str, ...]] = {
+    "audio_encode": ("cost_audio_encode", "cost_encode"),
+    "thinker": ("cost_llm",),
+    "talker_prep": ("cost_tts_prep",),
+    "talker": ("cost_tts",),
+    "token2wav": ("cost_token2wav",),
+}
+
+
+def stage_times(metrics: Mapping[str, Any] | None) -> dict[str, float]:
+    """Pull the per-stage seconds out of one upstream (or Talker) metrics mapping."""
+    if not metrics:
+        return {}
+    found: dict[str, float] = {}
+    for stage, keys in STAGE_METRIC_KEYS.items():
+        for key in keys:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                found[stage] = float(value)
+                break
+    return found
+
+
+@dataclass(frozen=True, slots=True)
+class UnitTiming:
+    """What one engine unit cost and what it emitted, for ``scripts/bench_rtf.py``.
+
+    This is the whole T1.8 seam: :class:`EngineSession` hands one of these to the optional
+    ``on_unit_timing`` callback for every unit it steps, and for every piece the Talker
+    thread finishes. It is deliberately not part of :class:`EngineProtocol` — the realtime
+    layer has no use for it, and the bench harness is the only consumer.
+
+    ``wall_sec`` is measured around the upstream call with :meth:`DeviceBackend.synchronize`
+    on both sides, so it is compute time rather than submission time. ``stages`` holds
+    whatever upstream reported for that unit (:data:`STAGE_METRIC_KEYS`); a stage upstream
+    does not report is simply absent.
+    """
+
+    #: Upstream ``index``, the 1-based counter over every step of the session.
+    unit_index: int
+    #: ``step`` for a Thinker unit, ``talker`` for work reported by the Talker thread.
+    source: str = "step"
+    #: Wall time for this unit, device-synchronized. 0.0 on a ``talker`` record, whose
+    #: cost is reported by the Talker runtime in :attr:`stages` instead.
+    wall_sec: float = 0.0
+    #: Subset of :data:`STAGE_NAMES` -> seconds.
+    stages: Mapping[str, float] = field(default_factory=dict)
+    is_listen: bool = True
+    end_of_turn: bool = False
+    unit_id: int | None = None
+    generation_id: int = 0
+    #: Incremental assistant text for the unit.
+    text: str = ""
+    #: Upstream ``generated_token_ids``: the Thinker tokens for this unit. This is the
+    #: sequence an M4 CUDA run is diffed against.
+    text_token_ids: tuple[int, ...] = ()
+    #: Upstream ``n_tts_tokens``: how many speak tokens went to the Talker. The ids
+    #: themselves never reach this module — upstream hands them straight to the speech
+    #: worker and puts only the count on the step event.
+    speak_token_count: int = 0
+    #: Samples of waveform this unit produced, at :data:`OUTPUT_SAMPLE_RATE`.
+    audio_samples: int = 0
+    #: The raw metrics mapping, as upstream (or the Talker runtime) reported it.
+    metrics: Mapping[str, Any] = field(default_factory=dict)
 
 
 def default_backend() -> DeviceBackend:
@@ -387,6 +480,12 @@ class EngineSession:
             :func:`talkover.engine.talker.talker_factory_from_config` builds the default
             one. When ``None`` (still the default this phase) the Talker runs inside the
             upstream step and its waveform rides the unit's own event.
+        on_unit_timing: T1.8. When given, it is called on the inference thread with one
+            :class:`UnitTiming` per stepped unit and per piece of Talker work.
+            ``scripts/bench_rtf.py`` is its only caller; the callback must be cheap and
+            must not raise (an exception is logged and dropped, never made terminal).
+            Installing one also adds a :meth:`DeviceBackend.synchronize` *before* each
+            step, so the measurement starts from a drained device queue.
     """
 
     def __init__(
@@ -400,6 +499,7 @@ class EngineSession:
         ref_audio_path: str | None = None,
         token2wav_dir: str | None = None,
         talker_factory: Callable[[Any, DeviceBackend], TalkerThread] | None = None,
+        on_unit_timing: Callable[[UnitTiming], None] | None = None,
     ) -> None:
         engine = config.engine
         if engine.talker_device is not None and engine.talker_device != engine.device:
@@ -413,6 +513,7 @@ class EngineSession:
 
         self._config = config
         self._backend = backend if backend is not None else get_backend(engine.device)
+        self._on_unit_timing = on_unit_timing
         self._session_factory = session_factory or (
             lambda: build_live_session(
                 config,
@@ -642,6 +743,31 @@ class EngineSession:
             is_audio_chunk=True,
         )
 
+    @staticmethod
+    def drained_event(
+        generation_id: int, unit_id: int, *, unit_index: int, cancelled: bool = False
+    ) -> EngineStepEvent:
+        """The Talker's drained marker for one turn (``talker_done``).
+
+        Published when the Talker finishes the request that carried ``end_of_turn``, and
+        when a generation is cancelled — both mean no further audio can arrive for the turn
+        ``generation_id`` names. It carries no waveform: it exists so that
+        ``talkover.realtime.mapping`` can hold the response close chain until the tail of
+        the turn has actually been sent (DESIGN.md 5.3).
+        """
+        return EngineStepEvent(
+            unit_index=unit_index,
+            is_listen=False,
+            text="",
+            end_of_turn=False,
+            interrupted=False,
+            unit_id=unit_id,
+            generation_id=generation_id,
+            is_audio_chunk=True,
+            talker_done=True,
+            metrics={"talker_cancelled": True} if cancelled else {},
+        )
+
     # -- event-loop side plumbing --------------------------------------------------
 
     async def _submit(self, kind: str, payload: Any = None) -> None:
@@ -753,6 +879,11 @@ class EngineSession:
 
     def _emit(self, call: Callable[[], Sequence[Any]]) -> None:
         """Run one stepping call, time it against the device, and publish its events."""
+        timing = self._on_unit_timing
+        if timing is not None:
+            # Work the previous unit left queued on the device would otherwise be charged
+            # to this one. Costs ~0.01 ms on MPS, so only the bench harness pays for it.
+            self._backend.synchronize()
         started = time.perf_counter()
         step_events = call()
         # The device queue must be empty before the clock is read, or the measurement
@@ -761,8 +892,71 @@ class EngineSession:
         elapsed = time.perf_counter() - started
         count = len(step_events) or 1
         for step_event in step_events:
-            self._publish(self.from_upstream(step_event, step_wall_time_sec=elapsed / count))
+            share = elapsed / count
+            self._publish(self.from_upstream(step_event, step_wall_time_sec=share))
+            if timing is not None:
+                self._report_timing(self.step_timing(step_event, wall_sec=share))
         self._publish_talker_audio()
+
+    # -- per-unit timing (T1.8) ----------------------------------------------------
+
+    @staticmethod
+    def step_timing(step_event: Any, *, wall_sec: float) -> UnitTiming:
+        """Build the :class:`UnitTiming` of one upstream ``DuplexStepEvent``."""
+        metrics = getattr(step_event, "metrics", None)
+        metrics = dict(metrics) if isinstance(metrics, Mapping) else {}
+        waveform = _as_float32_waveform(getattr(step_event, "audio_waveform", None))
+        token_ids = getattr(step_event, "generated_token_ids", ()) or ()
+        speak_tokens = metrics.get("n_tts_tokens")
+        return UnitTiming(
+            unit_index=int(step_event.index),
+            source="step",
+            wall_sec=wall_sec,
+            stages=stage_times(metrics),
+            is_listen=bool(step_event.is_listen),
+            end_of_turn=bool(step_event.end_of_turn),
+            unit_id=getattr(step_event, "unit_id", None),
+            generation_id=int(getattr(step_event, "generation_id", 0) or 0),
+            text=str(step_event.text or ""),
+            text_token_ids=tuple(int(value) for value in token_ids),
+            speak_token_count=int(speak_tokens) if isinstance(speak_tokens, int) else 0,
+            audio_samples=0 if waveform is None else int(waveform.size),
+            metrics=metrics,
+        )
+
+    @staticmethod
+    def talker_timing(output: TalkerChunk | TalkerDone, *, unit_index: int) -> UnitTiming:
+        """Build the :class:`UnitTiming` of one piece of Talker-thread work (T1.5).
+
+        The Talker runs off the Thinker's thread, so its cost never shows up in the step
+        wall time; it is reported by the runtime in the chunk's (or the done marker's)
+        metrics instead, which is where the ``talker`` and ``token2wav`` stages come from
+        on that path.
+        """
+        metrics = dict(output.metrics)
+        waveform = getattr(output, "waveform", None)
+        return UnitTiming(
+            unit_index=unit_index,
+            source="talker",
+            wall_sec=0.0,
+            stages=stage_times(metrics),
+            is_listen=False,
+            end_of_turn=bool(output.end_of_turn),
+            unit_id=output.unit_id,
+            generation_id=output.generation_id,
+            audio_samples=0 if waveform is None else int(np.asarray(waveform).size),
+            metrics=metrics,
+        )
+
+    def _report_timing(self, timing: UnitTiming) -> None:
+        """Hand one :class:`UnitTiming` to the bench callback; never let it break a call."""
+        callback = self._on_unit_timing
+        if callback is None:
+            return
+        try:
+            callback(timing)
+        except Exception:
+            LOGGER.exception("the unit-timing callback raised on unit %d", timing.unit_index)
 
     def _talker(self) -> TalkerThread | None:
         """The Talker thread, when one runs off the inference thread (T1.5)."""
@@ -777,6 +971,10 @@ class EngineSession:
         ``is_audio_chunk`` event. A failed unit is logged and leaves a gap in the audio: it
         does not end the session, because the Talker thread stays usable and one silent
         unit is a smaller loss than a dropped call.
+
+        A ``TalkerDone`` that ends a turn, and a ``TalkerInterrupted``, are published as a
+        ``talker_done`` marker (:meth:`drained_event`): the realtime mapping holds the
+        response close chain until the turn's tail has left the Talker (DESIGN.md 5.3).
         """
         talker = self._talker()
         if talker is None:
@@ -785,6 +983,8 @@ class EngineSession:
         for output in talker.drain_outputs():
             if isinstance(output, TalkerChunk):
                 self._publish(self.audio_event(output, unit_index=unit_index))
+                if self._on_unit_timing is not None:
+                    self._report_timing(self.talker_timing(output, unit_index=unit_index))
             elif isinstance(output, TalkerFailed):
                 LOGGER.error(
                     "talker failed on unit %d (generation %d): %s",
@@ -792,8 +992,23 @@ class EngineSession:
                     output.generation_id,
                     output.message,
                 )
-            elif isinstance(output, (TalkerDone, TalkerInterrupted)):
+            elif isinstance(output, TalkerDone):
                 LOGGER.debug("talker %s", output)
+                if self._on_unit_timing is not None:
+                    self._report_timing(self.talker_timing(output, unit_index=unit_index))
+                if output.end_of_turn:
+                    self._publish(
+                        self.drained_event(
+                            output.generation_id, output.unit_id, unit_index=unit_index
+                        )
+                    )
+            elif isinstance(output, TalkerInterrupted):
+                LOGGER.debug("talker %s", output)
+                self._publish(
+                    self.drained_event(
+                        output.cancelled_generation_id, 0, unit_index=unit_index, cancelled=True
+                    )
+                )
 
     def _drain_commands(self, error: BaseException) -> None:
         """Fail every queued command after a terminal error, so no caller hangs."""

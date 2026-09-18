@@ -139,10 +139,33 @@ Acceptance for the milestone: Thinker + Talker produce audible speech from an of
   `float16=True` aborts the process on MPS (MPSGraph dtype mismatch), so the vocoder stays float32 there.
   Three dependency pins were needed before `stepaudio2` would import at all (`torchaudio>=2.6,<2.7`, `setuptools<81`,
   `onnx<1.18`); all of it is in `docs/mps-porting-notes.md`, 2026-09-18.
+- 2026-09-18 (drain marker): `EngineStepEvent` gained the additive `talker_done` flag and `EngineSession` gained
+  `drained_event(...)`. `_publish_talker_audio` now publishes a marker event — `is_audio_chunk=True`,
+  `talker_done=True`, no waveform, `generation_id` / `unit_id` naming the turn — for a `TalkerDone` whose request
+  carried `end_of_turn`, and for every `TalkerInterrupted` (with `cancelled_generation_id`, since a cancelled
+  generation can produce no more audio either). It is the signal `realtime/mapping.py` holds the `end_of_turn` close
+  chain on, which closes the DESIGN.md section 11 risk row; nothing else in the engine reads it, and the in-step
+  Talker never emits one.
+- 2026-09-18 (`engine.token2wav_timesteps`): the knob the budget note above asked for is now a config field —
+  `int`, default upstream's 10, validated against `config.TOKEN2WAV_TIMESTEPS_RANGE` (`1..50`), rejected with
+  `ConfigError` outside it and for a non-integer (booleans included). `talker_factory_from_config` forwards it to
+  `build_talker_runtime(n_timesteps=...)` and on into `build_token2wav` -> `stepaudio2.Token2wav`;
+  `talkover check` echoes it on the `engine.token2wav_dir` line
+  (`... (<engine.base_model>/assets/token2wav), 10 flow-matching steps`); `configs/serve.example.yaml` and
+  DESIGN.md 4.4 / 9 document it as implemented. **The value still ships at 10**: only the latency of 5 (0.24 s) and
+  2 (0.14 s) was measured, never the quality, so choosing a lower default stays with T1.9.
+- Verified 2026-09-18: `uv run ruff check . && uv run ruff format .` clean for this task's files;
+  `uv run pytest tests/engine -q -rs` gives 141 passed, 3 skipped (2 CUDA, 1 awaiting the Gander weights) and
+  `uv run pytest -m cpu -q` 137 passed. New `cpu` cases in `tests/engine/test_talker.py`:
+  `build_token2wav` passes `n_timesteps` through to a fake `stepaudio2.Token2wav` (default 10, explicit 2), and the
+  factory built by `talker_factory_from_config` forwards it to `build_talker_runtime`. `tests/protocol/test_config.py`
+  pins the default, both range bounds, both out-of-range values, a string and a bool.
 
 - **Files**: `src/talkover/engine/talker.py`, `src/talkover/engine/backend/shims.py`,
   `src/talkover/engine/patches.py`, `src/talkover/engine/session.py`, `src/talkover/engine/protocol.py`,
-  `tests/engine/test_talker.py`, `pyproject.toml`, `docs/mps-porting-notes.md`.
+  `src/talkover/config.py`, `src/talkover/check.py`, `configs/serve.example.yaml`,
+  `tests/engine/test_talker.py`, `tests/protocol/test_config.py`, `pyproject.toml`,
+  `docs/mps-porting-notes.md`.
 - **Scope**: run Talker + token2wav on its own thread on the same device, handing over speak tokens through a queue and separating Thinker and Talker with `backend.synchronize()`. Keep upstream detached mode reachable when `engine.talker_device` names a different CUDA card; this phase it may raise `NotImplementedError` pointing at M4. Record how `detached_talker.py`'s `torch.cuda.device` / RNG / `synchronize` calls were bypassed.
 - **Depends on**: T1.4.
 - **Acceptance**: `mps` test produces a 24 kHz waveform from a fixed speak-token sequence; the Talker thread never blocks the Thinker step for longer than `synchronize`.
@@ -163,9 +186,36 @@ Acceptance for the milestone: Thinker + Talker produce audible speech from an of
 - **Depends on**: T1.4, T1.5, T1.6.
 - **Acceptance**: an output wav with audible speech exists; the test asserts non-silent output and at least one `is_listen: false` unit.
 
-### T1.8 `bench_rtf.py` and `talkover bench` — `todo`
+### T1.8 `bench_rtf.py` and `talkover bench` — `doing`
 
-- **Files**: `scripts/bench_rtf.py`, `src/talkover/cli.py`.
+- 2026-09-18: the harness is implemented; the numbers are not, because `MiniCPM-o-4_5` and
+  `Gander/thinker` are still downloading. `scripts/bench_rtf.py` loads the config, builds the backend and the
+  engine, pins the RNG from `--seed` through `backend.set_rng_state`, feeds a fixed clip in 1 s units
+  (`tests/fixtures/zh_order_16k.wav` by default, a deterministic synthetic tone with `--clip synthetic` or when
+  the fixture is absent, looped when `--units` asks for more), prints the per-stage mean / p50 / p95 / max table
+  against the DESIGN.md 4.4 budget, and writes the JSON dump (`schema: talkover.bench/1`) whose `token_sequence`
+  is the M4 cross-backend diff. The per-stage seam is `EngineSession(on_unit_timing=...)` (new, optional,
+  keyword-only): one `UnitTiming` per stepped unit and per piece of Talker-thread work, with `synchronize()` on
+  both sides of the upstream call and the stage costs read from upstream's `cost_llm` / `cost_tts_prep` /
+  `cost_tts` / `cost_token2wav`. `EngineProtocol` is unchanged. `talkover bench -c <config>` loads the script by
+  path and delegates to its `main`.
+- Verified 2026-09-18: `uv run ruff check` and `ruff format --check` clean on this task's files;
+  `uv run pytest -m cpu -q` 157 passed; `uv run pytest tests/engine -q -rs` 161 passed, 4 skipped (the two
+  weight-dependent `mps` cases among them). `tests/engine/test_bench.py` (20 `cpu` cases) covers the statistics
+  helpers, the clip loader, `stage_times` against upstream-shaped metrics, the hook against `EngineSession` with
+  a stub upstream session (a raising callback does not end the session), `run_bench` with `FakeBenchEngine`,
+  the pinned JSON key set, the seed-stable `token_sequence`, and `talkover bench --engine fake` writing the dump
+  into `tmp_path`. A fake run deliberately uses the `cpu` backend whatever `engine.device` says, so it runs in CI.
+- Open (awaiting weights): every real number. The recorded stages differ from the 4.4 table, which now says so:
+  upstream has no separate audio-encoding cost (it is inside `cost_llm`) and speak-token **ids** never reach
+  Talkover — the dump carries `n_tts_tokens` instead. The `mps` acceptance case
+  (`tests/engine/test_bench.py::test_real_bench_run_on_mps`) skips on incomplete checkpoints; once they land, run
+  `uv run talkover bench -c configs/serve.example.yaml --units 30 --warmup 2 --asr` and put the table, the p95
+  Thinker step (the 0.6 s phase-two trigger) and the `token2wav_timesteps` comparison into
+  `docs/mps-porting-notes.md`.
+
+- **Files**: `scripts/bench_rtf.py`, `src/talkover/cli.py`, `src/talkover/engine/session.py`,
+  `tests/engine/test_bench.py`.
 - **Scope**: run a fixed-seed clip, report per-unit wall time and per-stage time (audio encoding, Thinker step, Talker, token2wav, ASR) as mean / p50 / p95, and dump the token sequence to JSON so a later CUDA run (M4) can be diffed against it. Set RNG through `backend.set_rng_state`.
 - **Depends on**: T1.7.
 - **Acceptance**: `uv run talkover bench -c configs/serve.example.yaml` prints the table and writes the JSON; numbers are recorded in `docs/mps-porting-notes.md`.
@@ -222,6 +272,8 @@ Acceptance for the milestone: Cascade protocol cases pass against the fake engin
 ### T2.5 `DuplexStepEvent` to Realtime event mapping — `done`
 
 - Verified 2026-09-18: `uv run ruff check src/talkover/realtime tests/protocol && uv run ruff format src/talkover/realtime tests/protocol` pass, and `uv run pytest tests/protocol -q` gives 346 passed, of which `tests/protocol/test_mapping.py` is 26 new cases (normal turn, interruption, client cancel, ASR transcript, g711 output, the function-call pair, and the acceptance case that drives the scripted `FakeEngine` sequence through `pump_engine_events`). `ResponseMapper` in `src/talkover/realtime/mapping.py` owns the whole `response.*` lifecycle; `RealtimeSession.handle_engine_event` runs turn detection, then the mapper, then the optional `on_engine_event` hook, and `RealtimeSession.emit_function_call(call_id, name, arguments)` is the method T3.7 calls for `transfer_to_human`. Settled rules are appended to `docs/protocol-profile.md` §9: the close-chain order (a cancelled response inserts `conversation.item.truncated` before `response.done` and marks its item `incomplete`), `client_cancelled` vs `turn_detected`, the best-effort `usage` shapes, the duration-based `usage` of the transcription event, and the response a function call opens for itself when the model is not speaking. `is_audio_chunk` units (detached Talker, T1.5) only extend an open response. Open: nothing for this task; the Brain side of the function-call seam is T3.7.
+- 2026-09-18 (holding the close chain): the DESIGN.md section 11 risk — with the threaded Talker, `end_of_turn` closed the response before the turn's tail had been vocoded, and `mapping.py` dropped the late chunk — is settled and 5.3 / 11 now carry the rule. `ResponseMapper` marks the response **pending-close** on `end_of_turn` instead of closing it, and emits the chain when the engine's `talker_done` marker for that `generation_id` arrives (a marker for a *later* generation releases it too: the Talker only bumps the generation on a cancel, so the held turn can produce no more audio). Chunks arriving inside the hold are delivered normally, which is the whole point; a chunk with no response to extend is dropped and counted in `ResponseMapper.dropped_audio_chunks` instead of vanishing silently. `interrupted` is never held — a barge-in makes everything still in the Talker stale — and a non-listen unit arriving inside a hold belongs to the next turn, so it flushes the hold before opening its own response. `mapping.TALKER_DRAIN_TIMEOUT_SEC` (3 s, a constant and not a config key: it is a failure bound, not a tuning knob) arms an `asyncio` timer per hold, so a Talker that never reports costs the tail of one turn and never the response; the timer is cancelled by every close path, and `cancel_pending_close()` exists for a teardown that abandons the response instead of closing it. Threaded mode is **detected, not guessed**: upstream's `talker_state()` reports `metrics["talker"]["mode"] == "detached"` on every unit, which holds even a one-unit first turn that has not produced a chunk yet; any `is_audio_chunk` event latches the same flag for a fake engine that reports no metrics. Until the flag is set the T1.4 in-step path behaves exactly as before.
+- Verified 2026-09-18: `uv run pytest tests/protocol tests/brain -q` gives 763 passed, 18 skipped; `tests/protocol/test_mapping.py` is 36 cases, 10 of them new — in-step `end_of_turn` still closes at once and leaves `talker_threaded` false; a held turn delivers a chunk that arrives inside the hold and closes only on the marker; the section 11 regression (two chunks and a marker after `end_of_turn`, both `response.output_audio.delta` before `response.done`); the one-unit first turn held on the metrics alone; an interrupt closing at once with the following chunk counted as dropped; an interrupt cancelling a held response rather than completing it; the next turn flushing a hold the Talker never released into two distinct responses; the drain timeout closing an abandoned response as `completed`; the timer not surviving the response it guarded; and `cancel_pending_close` dropping a hold without emitting it. `uv run ruff check . && uv run ruff format .` clean for this task's files.
 
 - **Files**: `src/talkover/realtime/mapping.py`, `tests/protocol/test_mapping.py`.
 - **Scope**: the server → client half of the table: first `is_listen: false` unit opens `response.created` / `output_item.added` / `conversation.item.created`; `text` becomes `response.output_audio_transcript.delta`; `audio_waveform` becomes `response.output_audio.delta` (24 kHz, or g711 when configured); `end_of_turn` closes the response; `interrupted` closes with `status: "cancelled"` plus `conversation.item.truncated`; ASR segment becomes `conversation.item.input_audio_transcription.completed`; Brain `transfer_to_human` becomes one `response.function_call_arguments.delta` followed by `.done`.
@@ -255,7 +307,10 @@ Acceptance for the milestone: Cascade protocol cases pass against the fake engin
 - **Depends on**: T2.3, T2.4.
 - **Acceptance**: tests for resume inside the window and release after it.
 
-### T2.9 `talkover serve` and a live call — `todo`
+### T2.9 `talkover serve` and a live call — `doing`
+
+- 2026-09-18 (the code half; the live call waits for the weights): `talkover serve` is implemented end to end except for the acceptance itself. `cli.py` loads the config (a `ConfigError` or an unsupported `engine.device` exits 2), builds the device backend, calls `apply_patches(backend)` **before** importing `talkover.engine.session` and again right after it (that module applies the patches a second time against the device auto-detected at import, so the configured backend has to win), constructs `EngineSession(config, backend=backend)` and the ASR side channel, composes everything through `build_app`, logs a startup summary (`app.startup_summary`: listen address, device and dtype, the four checkpoint paths, the resolved ASR backend, the Brain LLM and whether its key is set, the echoed model name, and the static `engine.memory` estimate) and runs uvicorn on `server.host` / `server.port`. `talkover serve --check-only` stops after `build_app`: it binds no port and loads no weights, which is what makes the wiring testable while `~/models` is still downloading. **Lifecycle**: `build_app` installs a FastAPI lifespan — `engine.start()` and `AsrSideChannel.start()` before the first request, then `TalkoverApp.aclose()`, `AsrSideChannel.aclose()` and `engine.stop()` on shutdown — so no other module owns `start` / `stop` (`create_app` gained a `lifespan` seam for it). **Release**: `on_release` closes the bridge, unbinds and resets the ASR stream, and calls `app.reset_engine`, which never calls `engine.stop()`, so `/health` returns to `idle` (T2.8's note, DESIGN.md 5.7). Upstream has no "new conversation" call short of rebuilding `DuplexLiveSession`, which would reload the weights, so the reset is layered: an engine offering `reset()` gets one, any other engine gets `interrupt_output()`, and a failure is logged rather than raised. **ASR**: `AsrSideChannel` taps `feed_pcm16` through a thin delegating engine wrapper — the units the model is fed are exactly the 16 kHz pcm16 ASR wants — queues them (bounded, `ASR_QUEUE_UNITS = 32`, oldest dropped and counted when transcription falls behind), transcribes off the loop with `AsrStream.afeed`, and fans every `AsrEvent` out to **both** `RealtimeSession.on_asr_event` and `BrainBridge.on_asr_event`; a commit requests a flush and a release resets the stream. The ASR backend is built lazily inside `start()`, and a backend that cannot be loaded is logged and the call runs without transcripts rather than failing to serve. Also in this task: `create_app` echoes `default_model(config)` (the base-model directory name, `DEFAULT_MODEL` when unset) when the client sends no `?model=`, and the `/health` `brain` field is a real probe (`app.brain_ready`: a constructed provider plus, when Talkover built it from `config.brain`, a non-empty LLM key) instead of a flag pinned to `True`. `DefaultSession` and its T2.3 tests are untouched: it is still what a bare `create_app` uses, while `build_app` always passes `WebSocketSession`.
+- Verified 2026-09-18: `uv run ruff check . && uv run ruff format .` clean; `uv run pytest tests/protocol tests/brain -q` gives 763 passed, 18 skipped, `uv run pytest -m cpu -q` gives 157 passed (T1.9 and the `bench` task landed cases in parallel) and the whole suite is 924 passed, 22 skipped. New: `tests/protocol/test_app.py` (20 GPU-free cases — the lifespan starting and stopping the engine, `manage_engine=False`, a WebSocket round trip through the built application reaching the fake engine's `feed_pcm16` / `flush_pending`, release resetting instead of stopping with `/health` back at `idle`, an engine's own `reset()` preferred, a failing reset swallowed, the ASR fan-out to both consumers, the drop-oldest bound, a failing consumer not starving the other, the tap feeding one stream and both consumers over a live socket, a failing ASR backend not stopping the service, the `brain` probe, the `?model=` default, the startup summary and the CLI surface) and `tests/engine/test_serve_cli.py` (3 `cpu` cases for `serve --check-only`, an unsupported device and a missing file). `uv run talkover serve -c configs/serve.example.yaml --check-only` was run by hand and printed the startup summary with the memory estimate. Open: **the acceptance itself** — a live call on the M3 Max with audible replies, transcripts on both sides and a working `response.cancel`, from a browser Realtime client and from aicc with `pcm16` and with `g711_ulaw` — has **not** been run, because the checkpoints in `~/models` are still downloading. Nothing in the serve path has therefore met a real model, an ASR model or a real client; the fake engine and `FakeLLM` are the whole evidence so far. `README.md` documents the steps and marks that verification as pending.
 
 - **Files**: `src/talkover/cli.py`, new `src/talkover/app.py` (wiring of engine thread, protocol loop, Brain), `README.md`.
 - **Scope**: `serve` loads config, applies patches, builds backend, engine, ASR, and Brain, and runs uvicorn. Verify a real call from a browser Realtime client and from aicc with `input_audio_format: pcm16` and with `g711_ulaw`.

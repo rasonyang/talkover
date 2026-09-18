@@ -17,9 +17,17 @@ The rules, in the order a turn exercises them:
   the chunk boundaries stay seamless.
 - `end_of_turn: true` closes the response: `response.output_audio.done`,
   `response.output_audio_transcript.done`, `response.content_part.done`,
-  `response.output_item.done` and `response.done` with `status: "completed"`.
+  `response.output_item.done` and `response.done` with `status: "completed"`. With the
+  threaded Talker (DESIGN.md 4.2) the waveform of the unit that ended the turn has not been
+  vocoded yet, so the close chain is *held*: the response is marked pending-close and the
+  chain is emitted only when the engine's `talker_done` marker for that `generation_id`
+  arrives. Chunks that arrive in between still extend the response, so the tail of the turn
+  reaches the client. `TALKER_DRAIN_TIMEOUT_SEC` bounds the wait, so a Talker that never
+  finishes cannot hold the response open forever.
 - `interrupted: true` closes the same chain with `status: "cancelled"`, an `incomplete`
-  item, and `conversation.item.truncated` at the audio already sent.
+  item, and `conversation.item.truncated` at the audio already sent. An interrupt never
+  waits for the Talker: its chunks are already stale, and any that still arrive are dropped
+  and counted in `ResponseMapper.dropped_audio_chunks`.
 - An ASR segment becomes `conversation.item.input_audio_transcription.completed` against
   the last committed input item (`RealtimeSession.input_item_id`).
 - `ResponseMapper.emit_function_call` is the T3.7 seam: the Brain's `transfer_to_human`
@@ -32,6 +40,8 @@ event through `RealtimeSession.emit`, so it never touches the WebSocket.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -55,14 +65,27 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CONTENT_INDEX",
     "MESSAGE_OUTPUT_INDEX",
+    "TALKER_DRAIN_TIMEOUT_SEC",
     "ActiveResponse",
     "ResponseMapper",
 ]
+
+LOGGER = logging.getLogger(__name__)
 
 #: `content_index` is always 0: one audio part per assistant message (profile §9).
 CONTENT_INDEX = 0
 #: `output_index` of the assistant message item; a `function_call` follows it (profile §9).
 MESSAGE_OUTPUT_INDEX = 0
+
+#: How long a pending close waits for the Talker's `talker_done` marker, in seconds.
+#:
+#: The Talker owes the response at most the tail of one turn. A unit is one second and the
+#: whole engine budget for a unit is 1.0 s (DESIGN.md 4.4), so a Talker that is merely slow
+#: finishes well inside this; anything longer is a Talker failure, and the response is
+#: closed anyway with a warning rather than left open. It is a constant and not a config
+#: key because it is a failure bound, not a tuning knob: no deployment wants a different
+#: value, and the tail it protects is bounded by the unit clock.
+TALKER_DRAIN_TIMEOUT_SEC = 3.0
 
 #: Output formats that are g711 and therefore need the 24 kHz -> 8 kHz resampler.
 _G711_FORMATS = frozenset({"g711_ulaw", "g711_alaw", "audio/pcmu", "audio/pcma"})
@@ -95,24 +118,73 @@ class ActiveResponse:
         return base + len(self.tool_items)
 
 
+@dataclass
+class _PendingClose:
+    """A response whose close chain is waiting for the Talker to drain the turn."""
+
+    #: The response the chain will close; a different `active` means the wait is moot.
+    response_id: str
+    #: The Talker generation whose `talker_done` marker resolves the wait.
+    generation_id: int
+    #: `completed` today; kept explicit so an interrupt could be held the same way.
+    status: str
+    #: The `TALKER_DRAIN_TIMEOUT_SEC` guard, cancelled when the marker arrives in time.
+    timer: asyncio.Task[None] | None = None
+
+
 class ResponseMapper:
     """Turn the engine's unit stream into the `response.*` events of profile §9."""
 
-    def __init__(self, session: RealtimeSession) -> None:
+    def __init__(
+        self,
+        session: RealtimeSession,
+        *,
+        talker_drain_timeout_sec: float = TALKER_DRAIN_TIMEOUT_SEC,
+    ) -> None:
         self.session = session
         #: The streaming response, or `None` while the model is listening.
         self.active: ActiveResponse | None = None
+        #: Bound on the pending-close wait; see :data:`TALKER_DRAIN_TIMEOUT_SEC`.
+        self.talker_drain_timeout_sec = talker_drain_timeout_sec
+        #: Whether this session's Talker runs on its own thread (DESIGN.md 4.2).
+        #:
+        #: Latched, never cleared: upstream reports `metrics["talker"]["mode"]` on every
+        #: unit, and an `is_audio_chunk` event is proof on its own for a fake engine that
+        #: reports no metrics. Until it is set the in-step behaviour applies, so the T1.4
+        #: default path is bit-for-bit unchanged.
+        self.talker_threaded = False
+        #: Talker chunks that arrived with no response to extend, since the session began.
+        self.dropped_audio_chunks = 0
+        self._pending_close: _PendingClose | None = None
 
     # -- engine units ------------------------------------------------------
 
     async def on_engine_event(self, step: EngineStepEvent) -> None:
         """Map one model unit. This is what the session's engine-event pump calls."""
         if step.is_audio_chunk:
-            # A detached-Talker audio chunk carries nothing but the waveform of a unit
+            self.talker_threaded = True
+            if step.talker_done:
+                await self._on_talker_drained(step)
+                return
+            # A threaded-Talker audio chunk carries nothing but the waveform of a unit
             # already reported, so it may only extend the response that unit opened.
-            if self.active is not None and step.has_audio:
-                await self._emit_audio(self.active, step)
+            if not step.has_audio:
+                return
+            if self.active is None:
+                # The response closed before this chunk: an interrupt, or a close the
+                # drain timeout forced. The audio is stale, so it is dropped and counted.
+                self.dropped_audio_chunks += 1
+                return
+            await self._emit_audio(self.active, step)
             return
+        if _talker_is_detached(step.metrics):
+            self.talker_threaded = True
+        if self._pending_close is not None and not step.is_listen and not step.interrupted:
+            # The model has started the next turn while the previous one is still waiting
+            # for its tail. The tail has lost its race; close first so the new unit does
+            # not join the finished response. An `interrupted` unit is excluded: it must
+            # cancel the response being held, not complete it and cancel an empty new one.
+            await self._flush_pending_close("next turn started")
         if step.is_tool_call and self.active is None:
             # A native tool-call unit is the Cerebellum talking to the runtime, not to the
             # customer: it carries no speech, so it opens no response. What the Brain hands
@@ -140,9 +212,81 @@ class ResponseMapper:
         if step.has_audio:
             await self._emit_audio(active, step)
         if step.interrupted:
+            # A barge-in makes everything still in the Talker stale, so the close is never
+            # held: the client wants the model to stop now.
             await self.close_response("cancelled")
         elif step.end_of_turn:
-            await self.close_response("completed")
+            if self.talker_threaded:
+                self._begin_pending_close(active, step.generation_id, "completed")
+            else:
+                await self.close_response("completed")
+
+    # -- holding the close for the Talker (DESIGN.md 5.3) ------------------
+
+    def _begin_pending_close(self, active: ActiveResponse, generation_id: int, status: str) -> None:
+        """Mark `active` pending-close and arm the drain timeout."""
+        pending = _PendingClose(
+            response_id=active.id, generation_id=int(generation_id), status=status
+        )
+        self._pending_close = pending
+        pending.timer = asyncio.get_running_loop().create_task(
+            self._close_on_timeout(pending), name=f"talker-drain-{active.id}"
+        )
+
+    async def _on_talker_drained(self, step: EngineStepEvent) -> None:
+        """Resolve a pending close when the Talker reports the turn drained.
+
+        A marker for a *later* generation resolves it too: the Talker only bumps the
+        generation on a cancel, so the turn being waited on can produce no more audio.
+        """
+        pending = self._pending_close
+        if pending is None or step.generation_id < pending.generation_id:
+            return
+        await self._flush_pending_close("talker drained")
+
+    async def _flush_pending_close(self, reason: str) -> None:
+        """Emit the close chain a pending close has been holding."""
+        pending = self._pending_close
+        if pending is None:
+            return
+        self._pending_close = None
+        if pending.timer is not None:
+            pending.timer.cancel()
+            pending.timer = None
+        if self.active is None or self.active.id != pending.response_id:
+            return
+        LOGGER.debug("closing response %s after the held turn (%s)", pending.response_id, reason)
+        await self.close_response(pending.status)
+
+    async def _close_on_timeout(self, pending: _PendingClose) -> None:
+        """Close a held response anyway once the Talker has missed its bound."""
+        try:
+            await asyncio.sleep(self.talker_drain_timeout_sec)
+        except asyncio.CancelledError:  # pragma: no cover - the normal path
+            return
+        if self._pending_close is not pending:
+            return
+        pending.timer = None  # closing must not cancel the task doing the closing
+        LOGGER.warning(
+            "the Talker did not report generation %d drained within %.1fs; "
+            "closing response %s without its tail",
+            pending.generation_id,
+            self.talker_drain_timeout_sec,
+            pending.response_id,
+        )
+        await self._flush_pending_close("drain timeout")
+
+    def cancel_pending_close(self) -> None:
+        """Drop a held close without emitting it, and disarm its timer.
+
+        Nothing in the normal flow needs this — an interrupt and the timeout both go
+        through :meth:`close_response` — but a teardown that abandons the response rather
+        than closing it must not leave the timer task behind.
+        """
+        pending = self._pending_close
+        self._pending_close = None
+        if pending is not None and pending.timer is not None:
+            pending.timer.cancel()
 
     # -- response lifecycle ------------------------------------------------
 
@@ -211,6 +355,13 @@ class ResponseMapper:
         active = self.active
         if active is None:
             return
+        pending = self._pending_close
+        if pending is not None and pending.response_id == active.id:
+            # Reached from an interrupt, a client cancel or the timeout: the hold is over
+            # either way, and its timer must not fire against the next response.
+            self._pending_close = None
+            if pending.timer is not None:
+                pending.timer.cancel()
         self.active = None
         self.session.active_response_id = None
         cancelled = status == "cancelled"
@@ -443,6 +594,18 @@ class ResponseMapper:
             "max_output_tokens": self.session.session["max_output_tokens"],
             "metadata": dict(active.metadata) if active.metadata else None,
         }
+
+
+def _talker_is_detached(metrics: Mapping[str, Any]) -> bool:
+    """Whether the unit's metrics say the Talker runs on its own thread.
+
+    Upstream `DuplexLiveSession.talker_state()` reports `mode: "detached"` exactly when a
+    speech worker is installed, which for Talkover is the `TalkerThread` (DESIGN.md 4.2).
+    Reading it here lets the very first turn of a session be held, before any
+    `is_audio_chunk` event has proved the mode.
+    """
+    talker = metrics.get("talker")
+    return isinstance(talker, Mapping) and talker.get("mode") == "detached"
 
 
 def _to_pcm16(waveform: np.ndarray | None) -> np.ndarray:

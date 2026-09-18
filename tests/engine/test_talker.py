@@ -20,6 +20,7 @@ do.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ import pytest
 import torch
 
 from talkover.config import TalkoverConfig, load_config, parse_config
+from talkover.engine import talker as talker_module
 from talkover.engine.backend import DeviceBackend, get_backend
 from talkover.engine.backend.shims import talker_device_shim
 from talkover.engine.protocol import OUTPUT_SAMPLE_RATE
@@ -44,6 +46,7 @@ from talkover.engine.talker import (
     TalkerInterrupted,
     TalkerRuntime,
     TalkerThread,
+    build_token2wav,
     talker_factory_from_config,
 )
 
@@ -477,6 +480,56 @@ def test_talker_factory_requires_token2wav_assets(tmp_path: Path) -> None:
     config = _config(base_model="", ref_audio_path=str(reference))
     with pytest.raises(ValueError, match="token2wav"):
         talker_factory_from_config(config)
+
+
+@pytest.mark.cpu
+def test_build_token2wav_passes_the_configured_step_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`engine.token2wav_timesteps` reaches the upstream vocoder constructor (DESIGN.md 9)."""
+    seen: dict[str, Any] = {}
+
+    class FakeToken2wav:
+        def __init__(self, directory: str, *, float16: bool = False, n_timesteps: int = 10) -> None:
+            seen.update(directory=directory, float16=float16, n_timesteps=n_timesteps)
+
+    monkeypatch.setitem(sys.modules, "stepaudio2", SimpleNamespace(Token2wav=FakeToken2wav))
+    backend = get_backend("cpu")
+
+    build_token2wav(tmp_path, backend)
+    assert seen["n_timesteps"] == 10  # upstream's default when nothing asks otherwise
+
+    build_token2wav(tmp_path, backend, n_timesteps=2)
+    assert seen == {"directory": str(tmp_path), "float16": False, "n_timesteps": 2}
+
+
+@pytest.mark.cpu
+def test_the_talker_factory_forwards_token2wav_timesteps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "ref.wav"
+    reference.write_bytes(b"RIFF")
+    config = _config(
+        base_model="",
+        token2wav_dir=str(tmp_path),
+        ref_audio_path=str(reference),
+        token2wav_timesteps=5,
+    )
+    seen: dict[str, Any] = {}
+
+    def fake_build_talker_runtime(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(talker_module, "build_talker_runtime", fake_build_talker_runtime)
+    monkeypatch.setattr(talker_module, "TalkerThread", lambda runtime, backend: runtime)
+
+    factory = talker_factory_from_config(config)
+    factory(SimpleNamespace(), get_backend("cpu"))
+
+    assert seen["n_timesteps"] == 5
+    assert seen["token2wav_dir"] == str(tmp_path)
+    assert seen["prompt_wav_path"] == str(reference)
 
 
 # --------------------------------------------------------------------------------------

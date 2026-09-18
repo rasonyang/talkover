@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from talkover.config import (
+    TOKEN2WAV_TIMESTEPS_RANGE,
     AsrConfig,
     ConfigError,
     EngineConfig,
@@ -255,6 +256,30 @@ def test_engine_asset_paths_default_to_null_and_are_overridable(tmp_path: Path) 
 
     assert cfg.engine.token2wav_dir == "/models/token2wav"
     assert cfg.engine.ref_audio_path == "/voices/agent.wav"
+
+
+def test_token2wav_timesteps_defaults_to_upstreams_ten_and_is_validated(tmp_path: Path) -> None:
+    # The vocoder's flow-matching step count (DESIGN.md 4.4 / 9): upstream's default is 10.
+    cfg = load_config(write_config(tmp_path, "engine:\n  device: mps\n"))
+    assert cfg.engine.token2wav_timesteps == 10
+
+    cfg = load_config(write_config(tmp_path, "engine:\n  token2wav_timesteps: 5\n"))
+    assert cfg.engine.token2wav_timesteps == 5
+
+    low, high = TOKEN2WAV_TIMESTEPS_RANGE
+    for value in (low, high):
+        path = write_config(tmp_path, f"engine:\n  token2wav_timesteps: {value}\n")
+        assert load_config(path).engine.token2wav_timesteps == value
+
+    for value in (low - 1, high + 1):
+        with pytest.raises(ConfigError, match="engine.token2wav_timesteps"):
+            load_config(write_config(tmp_path, f"engine:\n  token2wav_timesteps: {value}\n"))
+
+    with pytest.raises(ConfigError, match="engine.token2wav_timesteps"):
+        load_config(write_config(tmp_path, "engine:\n  token2wav_timesteps: fast\n"))
+
+    with pytest.raises(ConfigError, match="engine.token2wav_timesteps"):
+        load_config(write_config(tmp_path, "engine:\n  token2wav_timesteps: true\n"))
 
 
 def test_invalid_engine_asset_paths_are_rejected(tmp_path: Path) -> None:
