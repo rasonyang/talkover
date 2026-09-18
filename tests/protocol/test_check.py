@@ -22,6 +22,7 @@ from talkover.check import (
 )
 from talkover.cli import main
 from talkover.config import load_config
+from talkover.engine import memory as memory_mod
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -109,6 +110,10 @@ def healthy_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(check_mod, "_git_head", lambda _dir: UPSTREAM_PINNED_COMMIT)
     monkeypatch.setattr(check_mod, "_find_spec", lambda _module: object())
     monkeypatch.setattr("talkover.engine.backend.get_backend", lambda device: _FakeBackend(device))
+    # The MPS budget is the host's physical memory, so without this the result would
+    # depend on the RAM of the machine running the suite (a 16 GB CI runner reports
+    # over_budget where the 128 GB dev machine does not). Pin it to the dev machine.
+    monkeypatch.setattr(memory_mod, "_host_memory_bytes", lambda: 128 * 1024**3)
     return upstream
 
 
